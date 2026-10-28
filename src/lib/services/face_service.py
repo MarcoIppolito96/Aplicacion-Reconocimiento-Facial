@@ -10,6 +10,7 @@ import torch
 import onnxruntime
 from lib.schemas import EmbeddingRecord, FaceDetection, PredictResult, AlignedFace
 from lib.storage.base import EmbeddingStoreProtocol
+from lib import face_pipeline as fp
 import os 
 import logging
 
@@ -89,8 +90,11 @@ class FaceService:
         self.det_score_threshold and self.det_input_size.
         """
         if detector_path is None:
-            return None
-        return self._load_model(detector_path)
+            raise ValueError("DETECTOR_MODEL_NAME no configurado (ej.: det_10g.onnx de buffalo_l).")
+        if not Path(detector_path).exists():
+            raise ValueError(f"No existe el archivo del detector: {detector_path}")
+        # SCRFD de InsightFace, mismo detector que en la notebook 1
+        return fp.cargar_detector(detector_path, self.det_input_size, self.det_score_threshold)
 
     def _load_image(self, source_path: str) -> np.ndarray:
         image = cv2.imread(source_path)
@@ -113,7 +117,13 @@ class FaceService:
         Each box is (x1, y1, x2, y2) in pixels (InsightFace convention).
         Return a list of tuples with the coordinates of the faces detected in the image.
         """
-        raise NotImplementedError("Not implemented")
+        alto, ancho = image.shape[:2]
+        cajas = []
+        for caja, _score, _landmarks in fp.detectar(self.detector, image, self.min_face_size):
+            x1, y1, x2, y2 = (int(round(v)) for v in caja)
+            # Recorta la caja a los bordes de la imagen y la pasa a enteros
+            cajas.append(self._clip_xyxy(x1, y1, x2, y2, alto, ancho))
+        return cajas  # lista vacía si no hay rostros
 
 
     def align_face(
@@ -123,14 +133,49 @@ class FaceService:
         Crop using box (x1, y1, x2, y2) and run FaceAnalysis on the crop.
         Return an AlignedFace object.
         """
-        raise NotImplementedError("Not implemented")
+        alto, ancho = image.shape[:2]
+        x1, y1, x2, y2 = box
+        # Recorte con margen alrededor de la caja: el detector necesita contexto para ubicar landmarks
+        margen_x, margen_y = int((x2 - x1) * self.align_margin), int((y2 - y1) * self.align_margin)
+        rx1, ry1, rx2, ry2 = self._clip_xyxy(x1 - margen_x, y1 - margen_y, x2 + margen_x, y2 + margen_y, alto, ancho)
+        recorte = image[ry1:ry2, rx1:rx2]
+
+        # Entre las caras del recorte, nos quedamos con la que más se superpone con la caja pedida
+        landmarks = None
+        mejor_iou = 0.0
+        for caja_rec, _score, puntos in fp.detectar(self.detector, recorte, tamanio_min_cara=0):
+            caja_img = caja_rec + np.array([rx1, ry1, rx1, ry1], dtype=np.float32)  # coords del recorte -> imagen
+            iou = self._iou(caja_img, np.array(box, dtype=np.float32))
+            if puntos is not None and iou > mejor_iou:
+                mejor_iou, landmarks = iou, puntos + np.array([rx1, ry1], dtype=np.float32)
+
+        if landmarks is not None:
+            cara_alineada = fp.alinear(image, landmarks, self.face_size)
+            landmarks_rel = landmarks - np.array([x1, y1], dtype=np.float32)  # relativos a la caja (lo pide el frontend)
+        else:
+            # Plan B sin landmarks: recorte simple redimensionado
+            cara_alineada = cv2.resize(image[y1:y2, x1:x2], (self.face_size, self.face_size))
+            landmarks_rel = None
+        return AlignedFace(bbox=[x1, y1, x2, y2], keypoints=landmarks_rel, image=cara_alineada)
 
     def extract_embedding_from_face(self, face: AlignedFace) -> list[float]:
         """
         Extract embedding from face.
         Return a list of floats representing the embedding of the face.
         """
-        raise NotImplementedError("Not implemented")
+        if face.embedding is not None:
+            return face.embedding
+        tensor = fp.preprocesar(face.image)  # mismo preprocesamiento que en el entrenamiento
+        if isinstance(self.model, onnxruntime.InferenceSession):
+            nombre_entrada = self.model.get_inputs()[0].name
+            embedding = self.model.run(None, {nombre_entrada: tensor})[0]
+        else:
+            # Modelo .pth: modo evaluación y sin cálculo de gradientes
+            self.model.eval()
+            with torch.no_grad():
+                embedding = self.model(torch.from_numpy(tensor)).cpu().numpy()
+        # Normaliza L2 y devuelve floats de Python (lo que espera pgvector)
+        return fp.normalizar_l2(embedding).astype(float).tolist()
         
     def _cosine(self, a: np.ndarray, b: np.ndarray) -> float:
         denom = np.linalg.norm(a) * np.linalg.norm(b)
