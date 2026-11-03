@@ -4,6 +4,39 @@ Plantilla base para desarrollar un sistema completo de detección, alineación, 
 
 > 📄 El enunciado completo del trabajo práctico está en [ENUNCIADO.md](ENUNCIADO.md).
 
+**Alumno:** Marco Ippolito
+
+## 🚀 Cómo correrlo (entrega)
+
+**Modelo elegido:** ArcFace (InsightFace `buffalo_l`) para los embeddings y SCRFD para la detección.
+**Umbral:** `SIMILARITY_THRESHOLD=0.243` (similitud coseno), calibrado en validación para FAR = 1e-3 (ver `2-train.ipynb`, sección 4.3).
+
+1. Clonar el repositorio y cambiar a la rama de la entrega:
+   ```bash
+   git clone https://github.com/MarcoIppolito96/Aplicacion-Reconocimiento-Facial.git
+   cd Aplicacion-Reconocimiento-Facial
+   git checkout feature/tp-reconocimiento-facial
+   ```
+2. Descargar los modelos desde el link público (solo lectura):
+   **https://drive.google.com/drive/folders/1cw74S4P0jSiEI0Mlo_AYOl8vOoA3yGX9?usp=sharing**
+   y copiar **estos dos archivos** en la carpeta `models/` de la raíz del repo:
+   ```text
+   models/
+   ├── det_10g.onnx      # detector SCRFD
+   └── w600k_r50.onnx    # reconocedor ArcFace (embedding de 512 dimensiones)
+   ```
+   > Fuente original de ambos modelos: paquete `buffalo_l` de InsightFace (https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip).
+   > En el mismo link está `cnn_propia.onnx`, la CNN entrenada en `2-train.ipynb` (modelo comparado y descartado).
+3. Levantar todo con Docker (el `.env.docker.example` ya está configurado):
+   ```bash
+   docker compose build
+   docker compose up -d
+   ```
+4. Verificar:
+   - `http://localhost:8000/health` debe responder `{"status":"ok","model":"w600k_r50.onnx"}`.
+   - Frontend: `http://localhost:8080` (pestañas *Registrar identidad* y *Predecir*).
+   - Swagger: `http://localhost:8000/docs`.
+
 ## Objetivo del backend
 
 Implementar una API asincrónica en Python que permita:
@@ -37,8 +70,9 @@ tuia-face-recognition-app/
 │       ├── api.py               # Endpoints /upload, /insert, /predict, /status, /files
 │       ├── config.py            # Configuración vía .env
 │       ├── schemas.py
+│       ├── face_pipeline.py     # Detección, alineación y preprocesamiento (compartido con las notebooks)
 │       ├── services/
-│       │   ├── face_service.py  # ⚠️ Funciones a implementar
+│       │   ├── face_service.py  # detect_faces, align_face y extract_embedding_from_face
 │       │   └── task_manager.py
 │       └── storage/
 │           ├── base.py
@@ -169,37 +203,61 @@ No hardcodeen parámetros: configúrenlos mediante `.env`.
 - Persistencia configurable en JSON o en PostgreSQL + pgvector (`USE_PGVECTOR`).
 - Frontend para registrar identidades, predecir y visualizar los resultados (cajas, etiquetas y keypoints).
 
-### A implementar por el grupo (`src/lib/services/face_service.py`)
+### Implementado (`src/lib/services/face_service.py` + `src/lib/face_pipeline.py`)
 
-Estas funciones hoy lanzan `NotImplementedError`:
+```text
+imagen BGR → detect_faces (SCRFD) → align_face (5 landmarks + norm_crop 112×112)
+           → extract_embedding_from_face (ArcFace, 512-d, L2) → identify (coseno ≥ 0.243, si no "unknown")
+```
 
-1. `detect_faces`: detección de rostros. Devuelve las cajas `(x1, y1, x2, y2)`.
-2. `align_face`: alineación con landmarks y normalización a `FACE_SIZE`. Devuelve un `AlignedFace`.
-3. `extract_embedding_from_face`: extracción del embedding de dimensión `EMBEDDING_DIM`, normalizado L2.
+1. `detect_faces`: detector SCRFD (`det_10g.onnx`), cargado una sola vez en `_load_detector`. Filtra por `DET_SCORE_THRESHOLD` y `MIN_FACE_SIZE`, recorta las cajas a la imagen con `_clip_xyxy` y devuelve `[]` si no hay rostros.
+2. `align_face`: vuelve a detectar en un recorte con margen (`ALIGN_MARGIN`) alrededor de la caja para obtener los 5 landmarks, se queda con la cara de mayor IoU con la caja pedida y alinea con una transformación de similitud a la plantilla de ArcFace (`norm_crop`, `FACE_SIZE`×`FACE_SIZE`). Los keypoints se devuelven **relativos a la caja**, como espera el frontend.
+3. `extract_embedding_from_face`: preprocesamiento BGR → RGB, `(x − 127.5) / 127.5`, CHW con dimensión de batch; inferencia con onnxruntime (o PyTorch si el modelo es `.pth`) y normalización L2. Devuelve floats de Python de largo `EMBEDDING_DIM`.
 
-Ver detalles y recomendaciones en [ENUNCIADO.md](ENUNCIADO.md#4-parte-3--integración-en-la-aplicación).
+El preprocesamiento vive en `face_pipeline.py` y lo importan **tanto las notebooks como el backend**, para garantizar que la entrada al modelo sea idéntica en entrenamiento e inferencia.
 
 ## Modelo y fine-tuning
 
-Completar en la entrega final:
+Detalle completo en `2-train.ipynb`. Modelos: **https://drive.google.com/drive/folders/1cw74S4P0jSiEI0Mlo_AYOl8vOoA3yGX9?usp=sharing**
 
-- Modelo elegido y link público de descarga
-- Arquitectura (ResNet, EfficientNet, ViT, CNN custom, etc.)
-- Justificación técnica y trade-offs frente al modelo descartado
-- Hiperparámetros y proceso de entrenamiento / fine-tuning
-- Umbral de similitud elegido y cómo se calibró
-- Análisis de errores (FP/FN)
-- Métricas: accuracy, precision, recall, AUC/EER
+| | Modelo A: CNN propia (descartado) | Modelo B: ArcFace (**elegido**) |
+|---|---|---|
+| Arquitectura | 4 bloques (2× Conv 3×3 + BatchNorm + ReLU, MaxPool), Global Average Pooling, Dropout 0,3, Linear + BatchNorm → embedding | ResNet-50 (InsightFace `w600k_r50`) |
+| Entrenamiento | Desde cero sobre 85 identidades de Pins (11.094 imágenes) | Preentrenado en WebFace600K (~600.000 identidades); sin fine-tuning |
+| Pérdida | Cross-entropy (label smoothing 0,1, pesos por clase); se usa la capa previa al clasificador | ArcFace (margen angular aditivo) |
+| Embedding | 128 dimensiones, L2 | 512 dimensiones, L2 |
+| Parámetros / tamaño | 1,2 M / 4,8 MB | 43,6 M / 174 MB |
+| Inferencia CPU (Colab) | 17 ms/rostro | 380 ms/rostro |
+
+**Hiperparámetros de la CNN:** AdamW (lr 1e-3, weight decay 5e-4), cosine annealing, batch 128, 30 épocas con early stopping (paciencia 5) y augmentation solo en train. Mejor accuracy de validación: 87,9% (época 29), sin overfitting. Un experimento sin augmentation llegó a 100% en train (overfitting) y empeoró en personas nuevas (AUC 0,807 contra 0,868).
+
+**Métricas sobre el test open-set** (20 personas nunca vistas por la CNN):
+
+| Métrica | CNN propia | ArcFace |
+|---|---|---|
+| AUC (verificación) | 0,868 | ≈ 1,000 |
+| EER | 21,5% | 0,25% |
+| TAR @ FAR = 1e-3 | 9,4% | 99,6% |
+| Top-1 / Top-5 (galería de 15 personas) | 65,8% / 94,7% | 100% / 100% |
+| Precision / Recall / F1 macro | 0,75 / 0,41 / 0,48 | 0,996 / 0,999 / 0,998 |
+| Desconocidos rechazados | 87,3% | 99,1% |
+
+**Justificación:** ArcFace separa casi perfectamente a personas nuevas, que es el escenario real de la app. La CNN propia generaliza parcialmente (AUC 0,87), pero sus distribuciones de similitud se superponen: con un umbral que evite confundir personas rechaza a la mayoría de las registradas. Las causas son la cantidad de identidades de entrenamiento (85 contra ~600.000), la pérdida softmax sin margen y la menor capacidad. Trade-offs: ArcFace es más pesado y lento, y su licencia es **no comercial / investigación**.
+
+**Umbral:** `0.243` (coseno), el menor umbral con FAR ≤ 1e-3 en los pares de **validación**. En test open-set da FAR 0,02% y TAR 99,1%.
+
+**Análisis de errores:** los falsos negativos de ArcFace son casos extremos (maquillaje de personaje, décadas de diferencia de edad, oclusiones grandes), y sus falsos positivos son parecidos reales con similitud baja (≈ 0,3). La CNN, en cambio, confunde personas por el color de pelo y el tono de la foto, con similitudes altas (≈ 0,8).
 
 ## Dataset
 
-Documentar:
+Detalle completo en `1-pre-processing.ipynb`.
 
-- Fuente de las imágenes (propias y/o públicas) y su licencia
-- Cantidad por clase/persona
-- Balance de clases
-- Variaciones (iluminación, pose, expresión)
-- Reglas de filtrado y calidad
+- **Fuente:** Pins Face Recognition (Kaggle, `hereisburak/pins-face-recognition`), licencia CC0-1.0. Son fotos de celebridades recopiladas de Pinterest; se usan solo con fines académicos y **no se suben al repositorio**.
+- **Tamaño:** 105 identidades y 17.534 imágenes (100% `.jpg`, 0 corruptas), entre 86 y 237 por persona (media 167): **desbalance moderado (2,8x)**, compensado con pesos por clase.
+- **Variaciones:** pose, edad, caracterizaciones, maquillaje, oclusiones (anteojos, manos) e iluminación; 7,3% en blanco y negro.
+- **Reglas de calidad:** sin rostro (6), más de un rostro ambiguo (1), rostro < 40 px (0), borrosas por varianza del Laplaciano < 30 (24), casi-duplicados con similitud ArcFace > 0,95 (609) y posibles etiquetas erróneas detectadas por clustering (6). Quedan **16.888 imágenes**.
+- **Splits:** 85 identidades closed-set (80/10/10 estratificado: train 11.094, val 1.387, test 1.387) y 20 identidades **open-set** solo para test (3.020), sin fuga de datos verificada.
+- **Sesgos:** mayoría de celebridades occidentales, de piel clara y adultos jóvenes, con fotos profesionales y retocadas: es esperable un peor desempeño en grupos subrepresentados.
 
 ## Notas importantes
 
